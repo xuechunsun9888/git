@@ -1,0 +1,372 @@
+import pandas as pd
+import numpy as np
+from sklearn.model_selection import KFold
+from sklearn.ensemble import RandomForestRegressor
+import statsmodels.api as sm
+from scipy import stats
+import os
+import warnings
+warnings.filterwarnings('ignore')
+import openpyxl
+from openpyxl.styles import Border, Side, Font, Alignment, PatternFill
+
+# 设置随机种子
+np.random.seed(42)
+
+# 数据路径
+data_path = r"I:\zyh19921276803\写作\数字经济与土地利用效率\数据\data20250310.csv"
+
+# 输出结果路径
+output_dir = os.path.dirname(data_path)
+output_path = os.path.join(output_dir, "DDML_IV_基准回归结果.xlsx")
+
+# 读取数据
+print("正在读取数据...")
+try:
+    data = pd.read_csv(data_path)
+    print(f"数据读取成功，共 {data.shape[0]} 行，{data.shape[1]} 列")
+except Exception as e:
+    print(f"数据读取失败: {e}")
+    raise
+
+# 打印列名，帮助调试
+print("数据集中的列名:")
+print(data.columns.tolist())
+
+# 检查RLDS变量是否存在
+if 'RLDS' not in data.columns:
+    print("警告: 数据中没有'RLDS'变量，工具变量法无法实施")
+    raise ValueError("缺少RLDS变量，请检查数据")
+
+# 数据预处理
+print("正在进行数据预处理...")
+# 检查并处理缺失值
+missing_values = data.isnull().sum()
+if missing_values.sum() > 0:
+    print(f"数据存在缺失值，总计: {missing_values.sum()} 个")
+    print(missing_values[missing_values > 0])
+    # 使用中位数填充数值型缺失值
+    for col in data.select_dtypes(include=[np.number]).columns:
+        if data[col].isnull().sum() > 0:
+            data[col] = data[col].fillna(data[col].median())
+    print("已使用中位数填充数值型缺失值")
+
+# 生成工具变量Z，与STATA代码保持一致
+print("正在生成工具变量...")
+data['Z'] = data['RLDS'] * (data['year'] - 2010)
+print(f"已生成工具变量 Z = RLDS * (year - 2010)")
+
+# 定义变量
+Y = 'ULGUE'  # 因变量
+D = 'DIF'    # 核心解释变量(内生变量)
+Z = 'Z'      # 工具变量
+X = ['GOV', 'INF', 'Popd', 'Trade', 'GPatent', 'ERS']  # 控制变量
+
+# 检查变量是否都在数据集中
+all_vars = [Y, D, Z] + X
+missing_vars = [var for var in all_vars if var not in data.columns]
+if missing_vars:
+    print(f"以下变量在数据集中不存在: {missing_vars}")
+    print("请检查变量名或数据集结构，以下是可用的列名:")
+    print(data.columns.tolist())
+    raise ValueError("变量不存在，请检查变量名")
+
+# 检查数据中是否有年份和城市标识符
+if 'year' not in data.columns:
+    print("警告: 数据中没有'year'列，无法添加年份固定效应")
+    has_year = False
+else:
+    has_year = True
+    print(f"发现年份变量，共有 {data['year'].nunique()} 个不同年份")
+
+if 'id' not in data.columns:
+    print("警告: 数据中没有'id'列，无法添加城市固定效应")
+    has_id = False
+else:
+    has_id = True
+    print(f"发现城市ID变量，共有 {data['id'].nunique()} 个不同城市")
+
+# 创建固定效应变量
+if has_year:
+    # 创建年份哑变量
+    year_dummies = pd.get_dummies(data['year'], prefix='year', drop_first=True)
+    data = pd.concat([data, year_dummies], axis=1)
+    year_dummy_cols = year_dummies.columns.tolist()
+    X = X + year_dummy_cols
+    print(f"已添加 {len(year_dummy_cols)} 个年份哑变量")
+
+if has_id:
+    # 创建城市哑变量
+    id_dummies = pd.get_dummies(data['id'], prefix='id', drop_first=True)
+    data = pd.concat([data, id_dummies], axis=1)
+    id_dummy_cols = id_dummies.columns.tolist()
+    X = X + id_dummy_cols
+    print(f"已添加 {len(id_dummy_cols)} 个城市哑变量")
+
+print(f"最终使用的控制变量数量: {len(X)}")
+
+# 实现双重去偏机器学习工具变量法(DDML-IV)
+print("开始实施双重去偏机器学习工具变量法(DDML-IV)...")
+
+# 设置K折交叉验证
+k_folds = 5
+kf = KFold(n_splits=k_folds, shuffle=True, random_state=42)
+
+# 存储每折的残差
+Y_res_all = np.zeros(data.shape[0])
+D_res_all = np.zeros(data.shape[0])
+Z_res_all = np.zeros(data.shape[0])
+
+# 对每折进行训练和预测
+fold = 1
+for train_idx, test_idx in kf.split(data):
+    print(f"正在处理第 {fold}/{k_folds} 折...")
+    
+    # 分割训练集和测试集
+    train_data = data.iloc[train_idx]
+    test_data = data.iloc[test_idx]
+    
+    # 1. 为Y回归拟合随机森林模型
+    rf_Y = RandomForestRegressor(
+        n_estimators=500,  # 增加树的数量
+        max_depth=None,    # 允许树充分生长
+        min_samples_split=2,
+        random_state=42
+    )
+    rf_Y.fit(train_data[X], train_data[Y])
+    
+    # 预测测试集上的Y
+    Y_pred = rf_Y.predict(test_data[X])
+    Y_true = test_data[Y].values
+    Y_res = Y_true - Y_pred
+    Y_res_all[test_idx] = Y_res
+    
+    # 2. 为D回归拟合随机森林模型
+    rf_D = RandomForestRegressor(
+        n_estimators=500,
+        max_depth=None,
+        min_samples_split=2,
+        random_state=42
+    )
+    rf_D.fit(train_data[X], train_data[D])
+    
+    # 预测测试集上的D
+    D_pred = rf_D.predict(test_data[X])
+    D_true = test_data[D].values
+    D_res = D_true - D_pred
+    D_res_all[test_idx] = D_res
+    
+    # 3. 为Z回归拟合随机森林模型 (这是IV方法的额外步骤)
+    rf_Z = RandomForestRegressor(
+        n_estimators=500,
+        max_depth=None,
+        min_samples_split=2,
+        random_state=42
+    )
+    rf_Z.fit(train_data[X], train_data[Z])
+    
+    # 预测测试集上的Z
+    Z_pred = rf_Z.predict(test_data[X])
+    Z_true = test_data[Z].values
+    Z_res = Z_true - Z_pred
+    Z_res_all[test_idx] = Z_res
+    
+    fold += 1
+
+# 使用残差进行二阶段最小二乘法(2SLS)
+print("正在进行二阶段最小二乘法估计...")
+
+# 第一阶段: 用Z残差解释D残差
+first_stage = sm.OLS(D_res_all, sm.add_constant(Z_res_all))
+first_stage_results = first_stage.fit()
+D_res_pred = first_stage_results.predict()
+
+# 第二阶段: 用预测的D残差解释Y残差
+second_stage = sm.OLS(Y_res_all, sm.add_constant(D_res_pred))
+second_stage_results = second_stage.fit(cov_type='HC1')  # 使用稳健标准误
+
+# 提取结果
+coef = second_stage_results.params[1]  # D的系数
+std_err = second_stage_results.bse[1]  # D的标准误
+t_stat = second_stage_results.tvalues[1]  # t值
+p_value = second_stage_results.pvalues[1]  # p值
+
+# 计算置信区间
+conf_int = second_stage_results.conf_int()
+try:
+    if hasattr(conf_int, 'iloc'):
+        lower_ci = conf_int.iloc[1, 0]
+        upper_ci = conf_int.iloc[1, 1]
+    else:
+        lower_ci = conf_int[1, 0]
+        upper_ci = conf_int[1, 1]
+except Exception as e:
+    print(f"获取置信区间时出错: {e}")
+    # 备用方法: 使用系数和标准误计算95%置信区间
+    lower_ci = coef - 1.96 * std_err
+    upper_ci = coef + 1.96 * std_err
+    print(f"使用备用方法计算置信区间: 系数 ± 1.96 * 标准误")
+
+# 常数项信息
+const_coef = second_stage_results.params[0]
+const_std_err = second_stage_results.bse[0]
+const_t = second_stage_results.tvalues[0]
+const_p = second_stage_results.pvalues[0]
+if hasattr(conf_int, 'iloc'):
+    const_ci_lower = conf_int.iloc[0, 0]
+    const_ci_upper = conf_int.iloc[0, 1]
+else:
+    const_ci_lower = conf_int[0, 0]
+    const_ci_upper = conf_int[0, 1]
+
+# 计算IV相关统计量
+# 计算F统计量 (第一阶段)
+first_stage_f = first_stage_results.fvalue
+first_stage_f_p = first_stage_results.f_pvalue
+
+# 计算相关系数 (工具变量相关性)
+z_d_corr = np.corrcoef(Z_res_all, D_res_all)[0, 1]
+
+# 计算R²
+first_stage_r2 = first_stage_results.rsquared
+second_stage_r2 = second_stage_results.rsquared
+
+print("\n========== DDML-IV 估计结果 ==========")
+print(f"处理变量 '{D}' 对因变量 '{Y}' 的效应估计 (使用工具变量 '{Z}'):")
+print(f"系数: {coef:.4f}")
+print(f"稳健标准误: {std_err:.4f}")
+print(f"t值: {t_stat:.4f}")
+print(f"p值: {p_value:.4f}")
+print(f"95%置信区间: [{lower_ci:.4f}, {upper_ci:.4f}]")
+print(f"第一阶段F统计量: {first_stage_f:.4f} (p值: {first_stage_f_p:.4f})")
+print(f"工具变量与内生变量相关系数: {z_d_corr:.4f}")
+print(f"第一阶段R²: {first_stage_r2:.4f}")
+print(f"第二阶段R²: {second_stage_r2:.4f}")
+print("=====================================")
+
+# 保存为Excel文件 (学术论文格式)
+print(f"正在将结果保存到: {output_path}")
+
+# 创建学术论文标准的表格数据
+table_data = [
+    ["变量", "系数", "稳健标准误", "z值", "p值", "95%置信区间"],
+    [D, f"{coef:.4f}***" if p_value < 0.01 else 
+        f"{coef:.4f}**" if p_value < 0.05 else 
+        f"{coef:.4f}*" if p_value < 0.1 else 
+        f"{coef:.4f}", 
+     f"{std_err:.4f}", f"{t_stat:.2f}", f"{p_value:.3f}", f"[{lower_ci:.4f}, {upper_ci:.4f}]"],
+    ["常数项", f"{const_coef:.4f}***" if const_p < 0.01 else 
+        f"{const_coef:.4f}**" if const_p < 0.05 else 
+        f"{const_coef:.4f}*" if const_p < 0.1 else 
+        f"{const_coef:.4f}", 
+     f"{const_std_err:.4f}", f"{const_t:.2f}", f"{const_p:.3f}", f"[{const_ci_lower:.4f}, {const_ci_upper:.4f}]"],
+    ["控制变量", "包含", "", "", "", ""],
+    ["年份固定效应", "包含", "", "", "", ""],
+    ["城市固定效应", "包含", "", "", "", ""],
+    ["样本量", f"{data.shape[0]}", "", "", "", ""],
+    ["工具变量", "RLDS*(year-2010)", "", "", "", ""],
+    ["第一阶段F统计量", f"{first_stage_f:.4f}", f"(p值: {first_stage_f_p:.4f})", "", "", ""],
+    ["内生变量-工具变量相关系数", f"{z_d_corr:.4f}", "", "", "", ""],
+    ["第一阶段R²", f"{first_stage_r2:.4f}", "", "", "", ""],
+    ["估计方法", "DDML-IV", "", "", "", ""]
+]
+
+# 保存表格数据
+table_df = pd.DataFrame(table_data)
+
+with pd.ExcelWriter(output_path, engine='openpyxl') as writer:
+    table_df.to_excel(writer, sheet_name='DDML-IV结果', index=False, header=False)
+    
+    # 获取工作簿和工作表
+    workbook = writer.book
+    worksheet = writer.sheets['DDML-IV结果']
+    
+    # 调整列宽
+    for idx, col in enumerate(worksheet.columns):
+        max_length = 0
+        column = col[0].column_letter
+        for cell in col:
+            if cell.value:
+                try:
+                    if len(str(cell.value)) > max_length:
+                        max_length = len(str(cell.value))
+                except:
+                    pass
+        adjusted_width = (max_length + 2)
+        worksheet.column_dimensions[column].width = adjusted_width
+    
+    # 添加表格说明
+    last_row = len(table_data) + 2
+    worksheet.cell(row=last_row, column=1).value = "注: ***、**、* 分别表示在1%、5%和10%的水平上显著。"
+    worksheet.cell(row=last_row+1, column=1).value = "DDML-IV: 双重去偏机器学习工具变量法，使用随机森林作为基础学习器，5折交叉验证。"
+
+# 使用openpyxl进行更精细的三线表格式化
+print("正在进行三线表格式化...")
+
+wb = openpyxl.load_workbook(output_path)
+ws = wb['DDML-IV结果']
+
+# 定义边框样式
+thin_border = Border(left=Side(style='thin'), 
+                     right=Side(style='thin'),
+                     top=Side(style='thin'),
+                     bottom=Side(style='thin'))
+
+thick_border = Border(left=Side(style='thin'),
+                      right=Side(style='thin'),
+                      top=Side(style='thick'),
+                      bottom=Side(style='thick'))
+
+middle_thick_border = Border(left=Side(style='thin'),
+                            right=Side(style='thin'),
+                            top=Side(style='thick'),
+                            bottom=Side(style='thin'))
+
+bottom_thick_border = Border(left=Side(style='thin'),
+                            right=Side(style='thin'),
+                            top=Side(style='thin'),
+                            bottom=Side(style='thick'))
+
+# 添加表格线
+for row_idx in range(1, len(table_data) + 1):
+    for col_idx in range(1, 7):
+        cell = ws.cell(row=row_idx, column=col_idx)
+        
+        # 表头行
+        if row_idx == 1:
+            cell.font = Font(bold=True)
+            cell.border = thick_border
+        # 变量数据行
+        elif row_idx == 2 or row_idx == 3:
+            if row_idx == 3:  # 常数项行添加底部粗线
+                cell.border = bottom_thick_border
+            else:
+                cell.border = thin_border
+            if col_idx == 1:  # 变量名列加粗
+                cell.font = Font(bold=True)
+        # 控制变量和固定效应行
+        elif row_idx >= 4 and row_idx <= 6:
+            cell.border = thin_border
+            if col_idx == 1:  # 描述列加粗
+                cell.font = Font(bold=True)
+        # IV相关统计量
+        elif row_idx >= 7 and row_idx <= 11:
+            cell.border = thin_border
+            if col_idx == 1:  # 描述列加粗
+                cell.font = Font(bold=True)
+        # 最后一行要加粗底线
+        elif row_idx == len(table_data):
+            cell.border = bottom_thick_border
+            if col_idx == 1:
+                cell.font = Font(bold=True)
+        # 其它行
+        else:
+            cell.border = thin_border
+            if col_idx == 1:
+                cell.font = Font(bold=True)
+
+# 保存修改后的文件
+wb.save(output_path)
+
+print("三线表格式化完成。")
+print(f"全部分析已完成，结果已保存至: {output_path}")
